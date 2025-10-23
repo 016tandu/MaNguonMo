@@ -19,7 +19,19 @@ from chronos import ChronosPipeline
 
 
 app = Flask(__name__)
-CORS(app)
+CORS(
+    app,
+    resources={
+        r"/api/*": {
+            "origins": [
+                "http://localhost:3000",
+                "http://localhost:5173",
+                "https://stock-predictor016.netlify.app",
+            ]
+        },
+        r"/health": {"origins": "*"},
+    },
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
