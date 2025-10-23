@@ -1,0 +1,29 @@
+# Virtual environments
+venv/
+backend/venv/
+
+# Python cache artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Model artifacts and cached data
+backend/data/
+backend/models/
+
+# Environment and secrets
+.env
+backend/.env
+
+# Node.js build artifacts
+frontend/node_modules/
+frontend/dist/
+
+# IDE/editor config
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db

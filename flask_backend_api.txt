@@ -1,0 +1,259 @@
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+import yfinance as yf
+import torch
+import torch.nn as nn
+import numpy as np
+import joblib
+from datetime import datetime, timedelta
+import os
+
+app = Flask(__name__)
+CORS(app)  # Enable CORS for React frontend
+
+# LSTM Model Definition (same as training script)
+class StockLSTM(nn.Module):
+    def __init__(self, input_size=1, hidden_size=50, num_layers=2, output_size=1):
+        super(StockLSTM, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+        
+    def forward(self, x):
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
+        out, _ = self.lstm(x, (h0, c0))
+        out = self.fc(out[:, -1, :])
+        return out
+
+# Cache for loaded models
+model_cache = {}
+scaler_cache = {}
+
+def load_or_train_model(ticker, lookback=60):
+    """Load existing model or train a new one"""
+    model_path = f'models/stock_model_{ticker}.pth'
+    scaler_path = f'models/scaler_{ticker}.pkl'
+    
+    # Check cache first
+    if ticker in model_cache:
+        return model_cache[ticker], scaler_cache[ticker]
+    
+    # Load from disk if exists
+    if os.path.exists(model_path) and os.path.exists(scaler_path):
+        model = StockLSTM()
+        model.load_state_dict(torch.load(model_path))
+        model.eval()
+        scaler = joblib.load(scaler_path)
+        
+        model_cache[ticker] = model
+        scaler_cache[ticker] = scaler
+        return model, scaler
+    
+    # Train new model if not exists
+    print(f"Training new model for {ticker}...")
+    from sklearn.preprocessing import MinMaxScaler
+    
+    # Download and prepare data
+    stock_data = yf.download(ticker, start='2020-01-01', end=datetime.now().strftime('%Y-%m-%d'))
+    if stock_data.empty:
+        return None, None
+    
+    data = stock_data['Close'].values.reshape(-1, 1)
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_data = scaler.fit_transform(data)
+    
+    # Prepare sequences
+    X, y = [], []
+    for i in range(lookback, len(scaled_data)):
+        X.append(scaled_data[i-lookback:i, 0])
+        y.append(scaled_data[i, 0])
+    
+    X = torch.FloatTensor(np.array(X)).unsqueeze(-1)
+    y = torch.FloatTensor(np.array(y)).unsqueeze(-1)
+    
+    # Train model
+    model = StockLSTM()
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    
+    model.train()
+    for epoch in range(30):  # Quick training
+        optimizer.zero_grad()
+        output = model(X)
+        loss = criterion(output, y)
+        loss.backward()
+        optimizer.step()
+    
+    model.eval()
+    
+    # Save model
+    os.makedirs('models', exist_ok=True)
+    torch.save(model.state_dict(), model_path)
+    joblib.dump(scaler, scaler_path)
+    
+    model_cache[ticker] = model
+    scaler_cache[ticker] = scaler
+    
+    return model, scaler
+
+@app.route('/api/stock/<ticker>', methods=['GET'])
+def get_stock_data(ticker):
+    """Get historical stock data"""
+    try:
+        period = request.args.get('period', '1y')
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period=period)
+        
+        if hist.empty:
+            return jsonify({'error': 'Stock not found'}), 404
+        
+        data = []
+        for date, row in hist.iterrows():
+            data.append({
+                'date': date.strftime('%Y-%m-%d'),
+                'price': float(row['Close']),
+                'open': float(row['Open']),
+                'high': float(row['High']),
+                'low': float(row['Low']),
+                'volume': int(row['Volume'])
+            })
+        
+        # Get stock info
+        info = stock.info
+        company_name = info.get('longName', ticker)
+        
+        return jsonify({
+            'ticker': ticker.upper(),
+            'name': company_name,
+            'data': data
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/predict/<ticker>', methods=['GET'])
+def predict_stock(ticker):
+    """Predict future stock prices"""
+    try:
+        days = int(request.args.get('days', 30))
+        lookback = 60
+        
+        # Load or train model
+        model, scaler = load_or_train_model(ticker, lookback)
+        
+        if model is None:
+            return jsonify({'error': 'Could not load or train model'}), 500
+        
+        # Get recent data
+        stock_data = yf.download(ticker, period='1y', progress=False)
+        if stock_data.empty:
+            return jsonify({'error': 'Stock not found'}), 404
+        
+        data = stock_data['Close'].values.reshape(-1, 1)
+        scaled_data = scaler.transform(data)
+        
+        # Get last sequence
+        last_sequence = scaled_data[-lookback:]
+        predictions = []
+        
+        # Predict future prices
+        model.eval()
+        with torch.no_grad():
+            current_sequence = last_sequence.copy()
+            
+            for _ in range(days):
+                x = torch.FloatTensor(current_sequence).unsqueeze(0).unsqueeze(-1)
+                pred = model(x)
+                predictions.append(pred.item())
+                current_sequence = np.append(current_sequence[1:], pred.cpu().numpy())
+        
+        # Inverse transform
+        predictions = scaler.inverse_transform(np.array(predictions).reshape(-1, 1))
+        
+        # Create prediction data
+        last_date = stock_data.index[-1]
+        prediction_data = []
+        
+        for i, pred_price in enumerate(predictions.flatten()):
+            pred_date = last_date + timedelta(days=i+1)
+            prediction_data.append({
+                'date': pred_date.strftime('%Y-%m-%d'),
+                'price': float(pred_price)
+            })
+        
+        return jsonify({
+            'ticker': ticker.upper(),
+            'predictions': prediction_data,
+            'current_price': float(data[-1][0]),
+            'predicted_price': float(predictions[-1][0])
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/info/<ticker>', methods=['GET'])
+def get_stock_info(ticker):
+    """Get stock company information"""
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+        
+        return jsonify({
+            'ticker': ticker.upper(),
+            'name': info.get('longName', ticker),
+            'sector': info.get('sector', 'N/A'),
+            'industry': info.get('industry', 'N/A'),
+            'marketCap': info.get('marketCap', 0),
+            'currency': info.get('currency', 'USD')
+        })
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/search', methods=['GET'])
+def search_stocks():
+    """Search for stocks by keyword"""
+    query = request.args.get('q', '')
+    
+    # Popular stocks for quick search
+    popular = {
+        'AAPL': 'Apple Inc.',
+        'GOOGL': 'Alphabet Inc.',
+        'MSFT': 'Microsoft Corporation',
+        'AMZN': 'Amazon.com Inc.',
+        'TSLA': 'Tesla Inc.',
+        'META': 'Meta Platforms Inc.',
+        'NVDA': 'NVIDIA Corporation',
+        'JPM': 'JPMorgan Chase & Co.',
+        'V': 'Visa Inc.',
+        'WMT': 'Walmart Inc.'
+    }
+    
+    results = []
+    query_lower = query.lower()
+    
+    for ticker, name in popular.items():
+        if query_lower in ticker.lower() or query_lower in name.lower():
+            results.append({'ticker': ticker, 'name': name})
+    
+    return jsonify({'results': results})
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({'status': 'healthy'})
+
+if __name__ == '__main__':
+    # Create models directory
+    os.makedirs('models', exist_ok=True)
+    
+    print("Starting Stock Prediction API...")
+    print("Available endpoints:")
+    print("  GET /api/stock/<ticker>?period=1y - Get historical data")
+    print("  GET /api/predict/<ticker>?days=30 - Get predictions")
+    print("  GET /api/info/<ticker> - Get stock info")
+    print("  GET /api/search?q=<query> - Search stocks")
+    
+    app.run(debug=True, host='0.0.0.0', port=5000)
