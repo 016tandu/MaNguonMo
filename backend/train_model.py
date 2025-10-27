@@ -11,7 +11,7 @@ import torch.nn as nn
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 
-from app import StockLSTM, MODELS_DIR, _fetch_history, UpstreamRateLimitError  # reuse architecture and paths
+from app import StockLSTM, DATA_DIR, _fetch_history, UpstreamRateLimitError  # reuse architecture and paths
 
 
 def _prepare_sequences(data: np.ndarray, lookback: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -24,7 +24,7 @@ def _prepare_sequences(data: np.ndarray, lookback: int) -> Tuple[np.ndarray, np.
 
 def train_model(ticker: str = "AAPL", lookback: int = 60, epochs: int = 50) -> Tuple[StockLSTM, MinMaxScaler]:
     """Train an LSTM model for a single ticker and persist the artefacts to disk."""
-    MODELS_DIR.mkdir(exist_ok=True)
+    DATA_DIR.mkdir(exist_ok=True)
 
     try:
         stock_data = _fetch_history(ticker, "5y")
@@ -67,8 +67,8 @@ def train_model(ticker: str = "AAPL", lookback: int = 60, epochs: int = 50) -> T
         test_loss = criterion(test_prediction, y_test_tensor)
         print(f"Validation Loss: {test_loss.item():.6f}")
 
-    model_path = MODELS_DIR / f"stock_model_{ticker}.pth"
-    scaler_path = MODELS_DIR / f"scaler_{ticker}.pkl"
+    model_path = DATA_DIR / f"stock_model_{ticker}.pth"
+    scaler_path = DATA_DIR / f"scaler_{ticker}.pkl"
     torch.save(model.state_dict(), model_path)
     joblib.dump(scaler, scaler_path)
 

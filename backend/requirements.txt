@@ -1,7 +1,7 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
 flask==3.0.3
 flask-cors==4.0.1
-torch==2.5.1
+torch==2.5.1+cpu
 scikit-learn==1.4.2
 numpy==1.26.4
 pandas==2.2.2

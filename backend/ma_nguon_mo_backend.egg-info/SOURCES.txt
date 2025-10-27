@@ -1,0 +1,10 @@
+README.md
+app.py
+pyproject.toml
+train_model.py
+wsgi.py
+ma_nguon_mo_backend.egg-info/PKG-INFO
+ma_nguon_mo_backend.egg-info/SOURCES.txt
+ma_nguon_mo_backend.egg-info/dependency_links.txt
+ma_nguon_mo_backend.egg-info/requires.txt
+ma_nguon_mo_backend.egg-info/top_level.txt

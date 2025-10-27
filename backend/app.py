@@ -15,7 +15,8 @@ import torch
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from chronos import ChronosPipeline
+import torch.nn as nn
+import joblib
 
 
 app = Flask(__name__)
@@ -30,11 +31,10 @@ load_dotenv()
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "").strip()
 POLYGON_BASE_URL = "https://api.polygon.io"
-CHRONOS_MODEL_ID = os.getenv("CHRONOS_MODEL_ID", "amazon/chronos-t5-tiny").strip() or "amazon/chronos-t5-tiny"
 
 _HISTORY_CACHE: Dict[Tuple[str, str], Tuple[float, pd.DataFrame]] = {}
 _INFO_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-_CHRONOS_PIPELINE: Optional[ChronosPipeline] = None
+_MODEL_CACHE: Dict[str, Tuple[float, Any, Any]] = {}
 
 CACHE_TTL_SECONDS = 300
 POPULAR_TICKERS = {
@@ -283,11 +283,23 @@ def _save_cached_search(query: str, results: List[Dict[str, Any]]) -> None:
     _save_json(_search_cache_path(query), payload)
 
 
-def _get_chronos_pipeline() -> ChronosPipeline:
-    global _CHRONOS_PIPELINE
-    if _CHRONOS_PIPELINE is None:
-        _CHRONOS_PIPELINE = ChronosPipeline.from_pretrained(CHRONOS_MODEL_ID)
-    return _CHRONOS_PIPELINE
+class StockLSTM(nn.Module):
+    """LSTM for stock prediction."""
+
+    def __init__(self, input_size: int = 1, hidden_layer_size: int = 100, output_size: int = 1):
+        super().__init__()
+        self.hidden_layer_size = hidden_layer_size
+        self.lstm = nn.LSTM(input_size, hidden_layer_size)
+        self.linear = nn.Linear(hidden_layer_size, output_size)
+        self.hidden_cell = (
+            torch.zeros(1, 1, self.hidden_layer_size),
+            torch.zeros(1, 1, self.hidden_layer_size),
+        )
+
+    def forward(self, input_seq: torch.Tensor) -> torch.Tensor:
+        lstm_out, self.hidden_cell = self.lstm(input_seq.view(len(input_seq), 1, -1), self.hidden_cell)
+        predictions = self.linear(lstm_out.view(len(input_seq), -1))
+        return predictions[-1]
 
 
 def _build_company_stub(ticker: str, latest_price: Optional[float] = None) -> Dict[str, Any]:
@@ -478,20 +490,29 @@ def _fetch_history(ticker: str, period: str) -> Optional[pd.DataFrame]:
     return frame
 
 
-def _forecast_with_chronos(closes: np.ndarray, prediction_length: int, num_samples: int = 100) -> np.ndarray:
-    pipeline = _get_chronos_pipeline()
-    context_length = getattr(pipeline.model.config, "context_length", 512)
-    context_array = closes[-context_length:]
-    context_tensor = torch.as_tensor(context_array, dtype=torch.float32)
+def _load_model(ticker: str) -> Tuple[Optional[StockLSTM], Optional[Any]]:
+    """Load the model and scaler for a given ticker."""
+    key = ticker.upper()
+    cached = _MODEL_CACHE.get(key)
+    if cached and _cache_is_fresh(cached[0]):
+        return cached[1], cached[2]
 
-    forecasts = pipeline.predict(context_tensor, prediction_length=prediction_length, num_samples=num_samples)
-    if forecasts.dim() == 3:
-        forecast_tensor = forecasts.mean(dim=1).squeeze(0)
-    elif forecasts.dim() == 2:
-        forecast_tensor = forecasts.mean(dim=0)
-    else:
-        forecast_tensor = forecasts.squeeze()
-    return forecast_tensor.detach().cpu().numpy()
+    model_path = DATA_DIR / f"stock_model_{key}.pth"
+    scaler_path = DATA_DIR / f"scaler_{key}.pkl"
+
+    if not model_path.exists() or not scaler_path.exists():
+        return None, None
+
+    try:
+        model = StockLSTM()
+        model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+        model.eval()
+        scaler = joblib.load(scaler_path)
+    except Exception:
+        return None, None
+
+    _MODEL_CACHE[key] = (time.time(), model, scaler)
+    return model, scaler
 
 
 @app.route("/api/stock/<ticker>", methods=["GET"])
@@ -556,20 +577,10 @@ def predict_stock(ticker: str):
     """Predict the next N days of closing prices for a given ticker."""
     try:
         days = int(request.args.get("days", 30))
+        model, scaler = _load_model(ticker)
 
-        cached_predictions = _load_cached_predictions(ticker, days)
-        if isinstance(cached_predictions, dict) and cached_predictions.get("predictions"):
-            info = _load_cached_info(ticker) or _build_company_stub(
-                ticker, cached_predictions.get("current_price")
-            )
-            if "current_price" in cached_predictions:
-                info["lastClose"] = cached_predictions["current_price"]
-            predictions_list = cached_predictions.get("predictions") or []
-            if predictions_list:
-                info["nextPrediction"] = predictions_list[-1].get("price")
-            _store_info_cache(ticker, info)
-            _save_cached_info(ticker, info)
-            return jsonify(cached_predictions)
+        if not model or not scaler:
+            return jsonify({"error": "Model for this ticker is not available."}), 404
 
         try:
             stock_data = _fetch_history(ticker, "1y")
@@ -580,32 +591,39 @@ def predict_stock(ticker: str):
             return jsonify({"error": "Stock not found"}), 404
 
         closes = stock_data["Close"].values.astype(float)
-        if closes.size == 0:
+        if closes.size < 60:
             return jsonify({"error": "Insufficient historical data to generate a forecast."}), 404
 
-        try:
-            forecast_values = _forecast_with_chronos(closes, days)
-        except UpstreamRateLimitError:
-            return jsonify({"error": "Polygon rate-limited the request. Please wait a moment and try again."}), 429
-        except Exception as exc:
-            return jsonify({"error": f"Chronos forecasting failed: {exc}"}), 500
+        # Prepare the data for prediction
+        last_60_days = closes[-60:]
+        scaled_data = scaler.transform(last_60_days.reshape(-1, 1))
+        X_test = torch.FloatTensor(scaled_data).unsqueeze(0)
 
-        if forecast_values.size < days:
-            return jsonify({"error": "Chronos returned an incomplete forecast."}), 500
+        # Make predictions
+        predictions = []
+        for _ in range(days):
+            with torch.no_grad():
+                model.hidden_cell = (torch.zeros(1, 1, model.hidden_layer_size), torch.zeros(1, 1, model.hidden_layer_size))
+                prediction = model(X_test)
+                predictions.append(prediction.item())
+                # Update X_test to include the new prediction
+                new_sequence = torch.cat((X_test[0, 1:], prediction.unsqueeze(0).unsqueeze(0)), 0)
+                X_test = new_sequence.unsqueeze(0)
 
-        predictions = forecast_values[:days]
+        # Inverse transform the predictions
+        predicted_prices = scaler.inverse_transform(np.array(predictions).reshape(-1, 1))
+
         last_date = stock_data.index[-1]
-
         prediction_data = [
             {"date": (last_date + timedelta(days=i + 1)).strftime("%Y-%m-%d"), "price": float(price)}
-            for i, price in enumerate(predictions)
+            for i, price in enumerate(predicted_prices.flatten())
         ]
 
         payload = {
             "ticker": ticker.upper(),
             "predictions": prediction_data,
             "current_price": float(closes[-1]),
-            "predicted_price": float(predictions[-1]),
+            "predicted_price": float(predicted_prices[-1]),
         }
 
         _save_cached_predictions(ticker, days, payload)
@@ -723,6 +741,4 @@ def health_check():
     return jsonify({"status": "healthy"})
 
 
-if __name__ == "__main__":
-    print("Starting Stock Prediction API on http://0.0.0.0:5000")
-    app.run(debug=True, host="0.0.0.0", port=5000)
+application = app
