@@ -513,7 +513,22 @@ def _load_model(ticker: str) -> Tuple[Optional[StockLSTM], Optional[Any]]:
     scaler_path = DATA_DIR / f"scaler_{key}.pkl"
 
     if not model_path.exists() or not scaler_path.exists():
-        return None, None
+        try:
+            # Attempt to download the pre-trained model and scaler
+            model_url = f"https://github.com/Vinh-2003/Stock-Prediction-Models/raw/main/models/{key}/stock_model_{key}.pth"
+            scaler_url = f"https://github.com/Vinh-2003/Stock-Prediction-Models/raw/main/models/{key}/scaler_{key}.pkl"
+            
+            model_response = requests.get(model_url, timeout=30)
+            model_response.raise_for_status()
+            with open(model_path, "wb") as f:
+                f.write(model_response.content)
+
+            scaler_response = requests.get(scaler_url, timeout=30)
+            scaler_response.raise_for_status()
+            with open(scaler_path, "wb") as f:
+                f.write(scaler_response.content)
+        except requests.RequestException:
+            return None, None
 
     try:
         model = StockLSTM()

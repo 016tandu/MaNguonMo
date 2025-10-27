@@ -9,7 +9,6 @@ __pycache__/
 *.pyd
 
 # Model artifacts and cached data
-backend/data/
 backend/models/
 
 # Environment and secrets
