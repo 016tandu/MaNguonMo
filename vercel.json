@@ -1,0 +1,41 @@
+{
+  "builds": [
+    {
+      "src": "backend/app.py",
+      "use": "@vercel/python",
+      "config": {
+        "maxLambdaSize": "15mb"
+      }
+    },
+    {
+      "src": "frontend/package.json",
+      "use": "@vercel/static-build",
+      "config": {
+        "distDir": "frontend/dist"
+      }
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "backend/app.py"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "frontend/dist/$1"
+    }
+  ],
+  "excludeFiles": [
+    "backend/venv/**",
+    "backend/__pycache__/**",
+    "backend/ma_nguon_mo_backend.egg-info/**",
+    "backend/.env",
+    "backend/train_model.py",
+    "backend/setup_venv.sh",
+    "backend/.python-version",
+    "frontend/node_modules/**"
+  ],
+  "includeFiles": [
+    "backend/data/**"
+  ]
+}
