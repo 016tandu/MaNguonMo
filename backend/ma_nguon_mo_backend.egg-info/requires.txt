@@ -1,0 +1,11 @@
+flask
+flask-cors
+torch
+scikit-learn
+numpy
+pandas
+joblib
+requests
+python-dotenv
+chronos-forecasting
+gunicorn
