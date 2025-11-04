@@ -51,25 +51,67 @@ type SearchResult = {
 };
 
 const LOCAL_API_BASE_URL = "http://127.0.0.1:5000";
-const REMOTE_API_BASE_URL = "https://stock-predictor-server.onrender.com";
+const PRIMARY_REMOTE_API_BASE_URL = "https://manguonmo-cksy.onrender.com";
+const LEGACY_REMOTE_API_BASE_URL = "https://stock-predictor-server.onrender.com";
 
-function resolveApiBaseUrl() {
-  const envUrl = import.meta.env.VITE_API_BASE_URL;
-  if (typeof envUrl === "string" && envUrl.trim().length > 0) {
-    return envUrl.replace(/\/+$/, "");
+function sanitizeBaseUrl(url?: string | null): string | null {
+  if (typeof url !== "string") {
+    return null;
+  }
+  const trimmed = url.trim();
+  if (!trimmed) {
+    return null;
+  }
+  return trimmed.replace(/\/+$/, "");
+}
+
+function buildApiBaseUrlCandidates(): string[] {
+  const candidates: string[] = [];
+
+  const envUrl = sanitizeBaseUrl(import.meta.env.VITE_API_BASE_URL);
+  if (envUrl) {
+    candidates.push(envUrl);
   }
 
   if (typeof window !== "undefined") {
     const hostname = window.location.hostname;
     if (hostname === "localhost" || hostname === "127.0.0.1") {
-      return LOCAL_API_BASE_URL;
+      candidates.push(LOCAL_API_BASE_URL);
     }
   }
 
-  return REMOTE_API_BASE_URL;
+  candidates.push(PRIMARY_REMOTE_API_BASE_URL, LEGACY_REMOTE_API_BASE_URL);
+
+  const seen = new Set<string>();
+  return candidates.filter((candidate) => {
+    if (!candidate || seen.has(candidate)) {
+      return false;
+    }
+    seen.add(candidate);
+    return true;
+  });
 }
 
-const API_BASE_URL = resolveApiBaseUrl();
+async function pingApiBase(url: string, externalSignal?: AbortSignal, timeoutMs = 1500): Promise<boolean> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+
+  const handleAbort = () => controller.abort();
+  externalSignal?.addEventListener("abort", handleAbort);
+
+  try {
+    if (externalSignal?.aborted) {
+      return false;
+    }
+    const response = await fetch(`${url}/health`, { signal: controller.signal });
+    return response.ok;
+  } catch {
+    return false;
+  } finally {
+    window.clearTimeout(timer);
+    externalSignal?.removeEventListener("abort", handleAbort);
+  }
+}
 
 const popularTickers = [
   "AAPL",
@@ -98,6 +140,8 @@ function formatNumber(value: number) {
 }
 
 function App() {
+  const apiCandidates = useMemo(() => buildApiBaseUrlCandidates(), []);
+  const [apiBaseUrl, setApiBaseUrl] = useState(() => apiCandidates[0] ?? "");
   const [ticker, setTicker] = useState("AAPL");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -108,9 +152,37 @@ function App() {
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [suggestionsLoading, setSuggestionsLoading] = useState(false);
 
+  useEffect(() => {
+    let isMounted = true;
+    const abortController = new AbortController();
+
+    const selectApiBase = async () => {
+      for (const candidate of apiCandidates) {
+        if (!candidate) {
+          continue;
+        }
+        const reachable = await pingApiBase(candidate, abortController.signal);
+        if (!isMounted) {
+          return;
+        }
+        if (reachable) {
+          setApiBaseUrl(candidate);
+          return;
+        }
+      }
+    };
+
+    selectApiBase();
+
+    return () => {
+      isMounted = false;
+      abortController.abort();
+    };
+  }, [apiCandidates]);
+
   const fetchStockData = async (symbol: string) => {
     const trimmedSymbol = symbol.trim().toUpperCase();
-    if (!trimmedSymbol) {
+    if (!trimmedSymbol || !apiBaseUrl) {
       return;
     }
 
@@ -120,13 +192,13 @@ function App() {
 
     try {
       const [historyRes, predictionsRes, infoRes] = await Promise.all([
-        axios.get(`${API_BASE_URL}/api/stock/${trimmedSymbol}`, {
+        axios.get(`${apiBaseUrl}/api/stock/${trimmedSymbol}`, {
           params: { period: "1y" },
         }),
-        axios.get(`${API_BASE_URL}/api/predict/${trimmedSymbol}`, {
+        axios.get(`${apiBaseUrl}/api/predict/${trimmedSymbol}`, {
           params: { days: 30 },
         }),
-        axios.get(`${API_BASE_URL}/api/info/${trimmedSymbol}`),
+        axios.get(`${apiBaseUrl}/api/info/${trimmedSymbol}`),
       ]);
 
       setHistoricalData(historyRes.data.data ?? []);
@@ -165,8 +237,11 @@ function App() {
   };
 
   useEffect(() => {
+    if (!apiBaseUrl) {
+      return;
+    }
     fetchStockData(ticker);
-  }, []);
+  }, [apiBaseUrl]);
 
   useEffect(() => {
     const query = ticker.trim();
@@ -181,7 +256,11 @@ function App() {
 
     const timeoutId = window.setTimeout(async () => {
       try {
-        const response = await axios.get(`${API_BASE_URL}/api/search`, {
+        if (!apiBaseUrl) {
+          setSuggestionsLoading(false);
+          return;
+        }
+        const response = await axios.get(`${apiBaseUrl}/api/search`, {
           params: { q: query },
           signal: controller.signal,
         });
@@ -200,7 +279,7 @@ function App() {
       controller.abort();
       window.clearTimeout(timeoutId);
     };
-  }, [ticker, showSuggestions]);
+  }, [ticker, showSuggestions, apiBaseUrl]);
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
