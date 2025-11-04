@@ -28,6 +28,7 @@ CORS(
                 "http://localhost:3000",
                 "http://localhost:5173",
                 "https://stock-predictor016.netlify.app",
+                "https://huysstock-predictor.netlify.app",
             ]
         },
         r"/health": {"origins": "*"},
