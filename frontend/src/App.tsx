@@ -50,11 +50,26 @@ type SearchResult = {
   name: string;
 };
 
-const API_BASE_URL =
+const LOCAL_API_BASE_URL = "http://127.0.0.1:5000";
+const REMOTE_API_BASE_URL = "https://stock-predictor-server.onrender.com";
 
-  import.meta.env.VITE_API_BASE_URL ??
+function resolveApiBaseUrl() {
+  const envUrl = import.meta.env.VITE_API_BASE_URL;
+  if (typeof envUrl === "string" && envUrl.trim().length > 0) {
+    return envUrl.replace(/\/+$/, "");
+  }
 
-  "https://stock-predictor-server.onrender.com/";
+  if (typeof window !== "undefined") {
+    const hostname = window.location.hostname;
+    if (hostname === "localhost" || hostname === "127.0.0.1") {
+      return LOCAL_API_BASE_URL;
+    }
+  }
+
+  return REMOTE_API_BASE_URL;
+}
+
+const API_BASE_URL = resolveApiBaseUrl();
 
 const popularTickers = [
   "AAPL",

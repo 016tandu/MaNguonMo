@@ -46,7 +46,7 @@ POLYGON_BASE_URL = "https://api.polygon.io"
 
 _HISTORY_CACHE: Dict[Tuple[str, str], Tuple[float, pd.DataFrame]] = {}
 _INFO_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-_MODEL_CACHE: Dict[str, Tuple[float, Any, Any]] = {}
+_MODEL_CACHE: Dict[str, Tuple[float, Any, Dict[str, Any]]] = {}
 
 CACHE_TTL_SECONDS = 300
 POPULAR_TICKERS = {
@@ -112,6 +112,17 @@ def _is_rate_limited_error(exc: Exception, ticker: str = "") -> bool:
 
 def _cache_is_fresh(timestamp: float) -> bool:
     return (time.time() - timestamp) <= CACHE_TTL_SECONDS
+
+
+def _add_business_days(start: datetime, days: int) -> datetime:
+    """Return the datetime that is `days` business days after `start`."""
+    current = start
+    remaining = max(int(days), 0)
+    while remaining > 0:
+        current += timedelta(days=1)
+        if current.weekday() < 5:  # Monday-Friday
+            remaining -= 1
+    return current
 
 def _period_to_days(period: str) -> int:
     period_norm = (period or "").strip().lower()
@@ -278,6 +289,121 @@ def _save_cached_info(ticker: str, info: Dict[str, Any]) -> None:
 
 def _store_info_cache(ticker: str, info: Dict[str, Any]) -> None:
     _INFO_CACHE[ticker.upper()] = (time.time(), info)
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    """Convert the provided value to a float when possible."""
+    if isinstance(value, (int, float)):
+        num = float(value)
+        return num if math.isfinite(num) else None
+
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if not cleaned or cleaned.lower() in {"none", "nan", "na", "n/a", "null"}:
+            return None
+        try:
+            num = float(cleaned.replace(",", ""))
+        except ValueError:
+            return None
+        return num if math.isfinite(num) else None
+
+    return None
+
+
+def _needs_overview_refresh(info: Dict[str, Any]) -> bool:
+    """Determine whether we should attempt to refresh company fundamentals."""
+    if not info:
+        return True
+
+    name = (info.get("name") or "").strip()
+    if not name or name.upper() == info.get("ticker", "").upper():
+        return True
+
+    market_cap = _coerce_float(info.get("marketCap"))
+    if market_cap is None or market_cap <= 0:
+        return True
+
+    week52_high = _coerce_float(info.get("week52High"))
+    week52_low = _coerce_float(info.get("week52Low"))
+    if week52_high is None or week52_low is None:
+        return True
+
+    return False
+
+
+def _fetch_company_overview_alpha_vantage(ticker: str) -> Optional[Dict[str, Any]]:
+    """Retrieve company fundamentals from Alpha Vantage's OVERVIEW endpoint."""
+    if not ALPHA_VANTAGE_API_KEY:
+        return None
+
+    params = {
+        "function": "OVERVIEW",
+        "symbol": ticker.upper(),
+        "apikey": ALPHA_VANTAGE_API_KEY,
+    }
+
+    try:
+        response = requests.get(
+            "https://www.alphavantage.co/query",
+            params=params,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+            headers=HTTP_HEADERS,
+        )
+    except requests.RequestException:
+        return None
+
+    if response.status_code == 429:
+        raise UpstreamRateLimitError("Alpha Vantage rate limit reached")
+
+    payload = response.json() or {}
+    note = payload.get("Note") or payload.get("Information")
+    if note:
+        raise UpstreamRateLimitError(note)
+
+    if not payload or "Symbol" not in payload:
+        return None
+
+    overview = {
+        "ticker": payload.get("Symbol", ticker.upper()),
+        "name": payload.get("Name") or payload.get("Symbol") or ticker.upper(),
+        "marketCap": _coerce_float(payload.get("MarketCapitalization")),
+        "peRatio": _coerce_float(payload.get("PERatio")),
+        "dividendYield": _coerce_float(payload.get("DividendYield")),
+        "eps": _coerce_float(payload.get("EPS")),
+        "week52High": _coerce_float(payload.get("52WeekHigh")),
+        "week52Low": _coerce_float(payload.get("52WeekLow")),
+        "sector": payload.get("Sector") or "N/A",
+        "industry": payload.get("Industry") or "N/A",
+        "currency": payload.get("Currency") or "USD",
+    }
+
+    return {key: value for key, value in overview.items() if value is not None}
+
+
+def _get_company_info(ticker: str, latest_price: Optional[float] = None) -> Dict[str, Any]:
+    """Return cached company metadata, refreshing from Alpha Vantage when needed."""
+    ticker_upper = ticker.upper()
+    cached_entry = _INFO_CACHE.get(ticker_upper)
+    if cached_entry and _cache_is_fresh(cached_entry[0]):
+        info = dict(cached_entry[1])
+    else:
+        disk_info = _load_cached_info(ticker)
+        info = dict(disk_info) if isinstance(disk_info, dict) else _build_company_stub(ticker)
+
+    if _needs_overview_refresh(info):
+        try:
+            overview = _fetch_company_overview_alpha_vantage(ticker)
+        except UpstreamRateLimitError:
+            overview = None
+        if overview:
+            info.update(overview)
+
+    if latest_price is not None:
+        info["lastClose"] = float(latest_price)
+
+    _store_info_cache(ticker, info)
+    _save_cached_info(ticker, info)
+    return info
 
 
 def _load_cached_search(query: str) -> Optional[List[Dict[str, Any]]]:
@@ -502,44 +628,32 @@ def _fetch_history(ticker: str, period: str) -> Optional[pd.DataFrame]:
     return frame
 
 
-def _load_model(ticker: str) -> Tuple[Optional[StockLSTM], Optional[Any]]:
-    """Load the model and scaler for a given ticker."""
-    key = ticker.upper()
-    cached = _MODEL_CACHE.get(key)
+def _load_model(_: str) -> Tuple[Optional[Any], Optional[Dict[str, Any]]]:
+    """Load the shared Random Forest model used for price predictions."""
+    cache_key = "__GLOBAL_RANDOM_FOREST__"
+    cached = _MODEL_CACHE.get(cache_key)
     if cached and _cache_is_fresh(cached[0]):
         return cached[1], cached[2]
 
-    model_path = DATA_DIR / f"stock_model_{key}.pth"
-    scaler_path = DATA_DIR / f"scaler_{key}.pkl"
-
-    if not model_path.exists() or not scaler_path.exists():
-        try:
-            # Attempt to download the pre-trained model and scaler
-            model_url = f"https://github.com/Vinh-2003/Stock-Prediction-Models/raw/main/models/{key}/stock_model_{key}.pth"
-            scaler_url = f"https://github.com/Vinh-2003/Stock-Prediction-Models/raw/main/models/{key}/scaler_{key}.pkl"
-            
-            model_response = requests.get(model_url, timeout=30)
-            model_response.raise_for_status()
-            with open(model_path, "wb") as f:
-                f.write(model_response.content)
-
-            scaler_response = requests.get(scaler_url, timeout=30)
-            scaler_response.raise_for_status()
-            with open(scaler_path, "wb") as f:
-                f.write(scaler_response.content)
-        except requests.RequestException:
-            return None, None
+    model_path = BASE_DIR / "models" / "random_forest_model.pkl"
+    if not model_path.exists():
+        return None, None
 
     try:
-        model = StockLSTM()
-        model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
-        model.eval()
-        scaler = joblib.load(scaler_path)
+        model = joblib.load(model_path)
     except Exception:
         return None, None
 
-    _MODEL_CACHE[key] = (time.time(), model, scaler)
-    return model, scaler
+    feature_names = getattr(model, "feature_names_in_", None)
+    if feature_names is None:
+        return None, None
+
+    metadata = {
+        "feature_names": list(feature_names),
+        "feature_index": {name: idx for idx, name in enumerate(feature_names)},
+    }
+    _MODEL_CACHE[cache_key] = (time.time(), model, metadata)
+    return model, metadata
 
 
 @app.route("/api/stock/<ticker>", methods=["GET"])
@@ -570,19 +684,25 @@ def get_stock_data(ticker: str):
         latest_price = data[-1]["price"] if data else None
         ticker_upper = ticker.upper()
 
-        info: Dict[str, Any]
-        cached_entry = _INFO_CACHE.get(ticker_upper)
-        if cached_entry and _cache_is_fresh(cached_entry[0]):
-            info = dict(cached_entry[1])
-        else:
-            disk_info = _load_cached_info(ticker)
-            info = dict(disk_info) if isinstance(disk_info, dict) else _build_company_stub(ticker)
+        try:
+            info = _get_company_info(ticker, latest_price)
+        except UpstreamRateLimitError:
+            info = _build_company_stub(ticker, latest_price)
 
-        if latest_price is not None:
-            info["lastClose"] = latest_price
-
-        _store_info_cache(ticker, info)
-        _save_cached_info(ticker, info)
+        trailing_history = history.tail(min(len(history), 252))
+        if not trailing_history.empty:
+            computed_high = float(trailing_history["High"].max())
+            computed_low = float(trailing_history["Low"].min())
+            updated = False
+            if _coerce_float(info.get("week52High")) is None:
+                info["week52High"] = computed_high
+                updated = True
+            if _coerce_float(info.get("week52Low")) is None:
+                info["week52Low"] = computed_low
+                updated = True
+            if updated:
+                _store_info_cache(ticker, info)
+                _save_cached_info(ticker, info)
 
         return jsonify(
             {
@@ -604,10 +724,21 @@ def predict_stock(ticker: str):
     """Predict the next N days of closing prices for a given ticker."""
     try:
         days = int(request.args.get("days", 30))
-        model, scaler = _load_model(ticker)
+        if days <= 0:
+            raise ValueError
+    except ValueError:
+        return jsonify({"error": "Invalid days parameter. Please provide a positive integer."}), 400
 
-        if not model or not scaler:
-            return jsonify({"error": "Model for this ticker is not available."}), 404
+    try:
+        model, metadata = _load_model(ticker)
+        if not model or not metadata:
+            return jsonify({"error": "Prediction model is not available."}), 503
+
+        feature_index = metadata.get("feature_index") or {}
+        feature_names = metadata.get("feature_names") or []
+        feature_count = len(feature_names)
+        if feature_count == 0:
+            return jsonify({"error": "Prediction model is missing feature metadata."}), 500
 
         try:
             stock_data = _fetch_history(ticker, "1y")
@@ -617,46 +748,124 @@ def predict_stock(ticker: str):
         if stock_data is None or stock_data.empty:
             return jsonify({"error": "Stock not found"}), 404
 
-        closes = stock_data["Close"].values.astype(float)
-        if closes.size < 60:
-            return jsonify({"error": "Insufficient historical data to generate a forecast."}), 404
+        if not {"Open", "High", "Low", "Close"}.issubset(stock_data.columns):
+            return jsonify({"error": "Historical data missing required fields."}), 500
 
-        # Prepare the data for prediction
-        last_60_days = closes[-60:]
-        scaled_data = scaler.transform(last_60_days.reshape(-1, 1))
-        X_test = torch.FloatTensor(scaled_data).unsqueeze(0)
+        last_row = stock_data.iloc[-1]
+        last_close = float(last_row["Close"])
+        last_open = float(last_row["Open"])
+        last_high = float(last_row["High"])
+        last_low = float(last_row["Low"])
 
-        # Make predictions
-        predictions = []
-        for _ in range(days):
-            with torch.no_grad():
-                model.hidden_cell = (torch.zeros(1, 1, model.hidden_layer_size), torch.zeros(1, 1, model.hidden_layer_size))
-                prediction = model(X_test)
-                predictions.append(prediction.item())
-                # Update X_test to include the new prediction
-                new_sequence = torch.cat((X_test[0, 1:], prediction.unsqueeze(0).unsqueeze(0)), 0)
-                X_test = new_sequence.unsqueeze(0)
+        try:
+            info = _get_company_info(ticker, last_close)
+        except UpstreamRateLimitError:
+            info = _build_company_stub(ticker, last_close)
 
-        # Inverse transform the predictions
-        predicted_prices = scaler.inverse_transform(np.array(predictions).reshape(-1, 1))
+        trailing = stock_data.tail(min(len(stock_data), 252))
+        computed_high = float(trailing["High"].max())
+        computed_low = float(trailing["Low"].min())
 
-        last_date = stock_data.index[-1]
-        prediction_data = [
-            {"date": (last_date + timedelta(days=i + 1)).strftime("%Y-%m-%d"), "price": float(price)}
-            for i, price in enumerate(predicted_prices.flatten())
+        week52_high = _coerce_float(info.get("week52High")) or computed_high
+        week52_low = _coerce_float(info.get("week52Low")) or computed_low
+        info["week52High"] = week52_high
+        info["week52Low"] = week52_low
+
+        market_cap = _coerce_float(info.get("marketCap")) or 0.0
+        pe_ratio = _coerce_float(info.get("peRatio")) or 0.0
+        dividend_yield = _coerce_float(info.get("dividendYield"))
+        if dividend_yield is None:
+            dividend_yield = 0.0
+        eps = _coerce_float(info.get("eps")) or 0.0
+
+        ticker_upper = ticker.upper()
+        ticker_feature = None
+        ticker_candidates = [
+            f"Ticker_{ticker_upper}",
+            f"Ticker_{ticker_upper.replace('.', '_')}",
+            f"Ticker_{''.join(ch for ch in ticker_upper if ch.isalnum())}",
         ]
+        for candidate in ticker_candidates:
+            if candidate in feature_index:
+                ticker_feature = candidate
+                break
+
+        volatility_subset = stock_data.tail(min(len(stock_data), 15))
+        volatility = 0.02
+        if not volatility_subset.empty:
+            denominator = max(float(volatility_subset["Close"].iloc[-1]), 1e-6)
+            if denominator:
+                high_span = float(volatility_subset["High"].max())
+                low_span = float(volatility_subset["Low"].min())
+                raw_volatility = (high_span - low_span) / denominator
+                volatility = float(np.clip(raw_volatility, 0.005, 0.12))
+
+        returns = stock_data["Close"].pct_change().dropna().tail(min(len(stock_data) - 1, 30))
+        trend = float(np.clip(returns.mean() if not returns.empty else 0.0, -0.03, 0.03))
+
+        predictions: List[float] = []
+        current_open = last_open
+        current_high = last_high
+        current_low = last_low
+        current_week_high = max(week52_high, last_high)
+        current_week_low = min(week52_low, last_low)
+
+        def set_feature(vector: np.ndarray, name: str, value: float) -> None:
+            idx = feature_index.get(name)
+            if idx is not None and math.isfinite(value):
+                vector[idx] = float(value)
+
+        feature_length = feature_count
+
+        for step in range(days):
+            if step > 0:
+                previous_close = predictions[-1]
+                drift = 1.0 + trend
+                current_open = previous_close * drift
+                current_high = current_open * (1.0 + volatility)
+                current_low = current_open * (1.0 - volatility)
+                current_week_high = max(current_week_high, current_high, previous_close)
+                current_week_low = min(current_week_low, current_low, previous_close)
+
+            vector = np.zeros(feature_length, dtype=np.float64)
+            set_feature(vector, "Open Price", current_open)
+            set_feature(vector, "High Price", current_high)
+            set_feature(vector, "Low Price", current_low)
+            set_feature(vector, "Market Cap", market_cap)
+            set_feature(vector, "PE Ratio", pe_ratio)
+            set_feature(vector, "Dividend Yield", dividend_yield)
+            set_feature(vector, "EPS", eps)
+            set_feature(vector, "52 Week High", current_week_high)
+            set_feature(vector, "52 Week Low", current_week_low)
+
+            if ticker_feature:
+                vector[feature_index[ticker_feature]] = 1.0
+
+            prediction_frame = pd.DataFrame([vector], columns=feature_names)
+            predicted_close = float(model.predict(prediction_frame)[0])
+            predictions.append(predicted_close)
+            current_week_high = max(current_week_high, predicted_close)
+            current_week_low = min(current_week_low, predicted_close)
+
+        last_timestamp = pd.to_datetime(stock_data.index[-1])
+        base_datetime = (
+            last_timestamp.to_pydatetime() if hasattr(last_timestamp, "to_pydatetime") else last_timestamp
+        )
+        prediction_data = []
+        for idx, price in enumerate(predictions, start=1):
+            target_date = _add_business_days(base_datetime, idx)
+            prediction_data.append({"date": target_date.strftime("%Y-%m-%d"), "price": float(price)})
 
         payload = {
-            "ticker": ticker.upper(),
+            "ticker": ticker_upper,
             "predictions": prediction_data,
-            "current_price": float(closes[-1]),
-            "predicted_price": float(predicted_prices[-1]),
+            "current_price": last_close,
+            "predicted_price": float(predictions[-1]) if predictions else last_close,
         }
 
         _save_cached_predictions(ticker, days, payload)
 
-        info = _load_cached_info(ticker) or _build_company_stub(ticker, payload["current_price"])
-        info["lastClose"] = payload["current_price"]
+        info["lastClose"] = last_close
         if prediction_data:
             info["nextPrediction"] = prediction_data[-1]["price"]
         _store_info_cache(ticker, info)
@@ -671,15 +880,10 @@ def predict_stock(ticker: str):
 def get_stock_info(ticker: str):
     """Return high-level company metadata for the given ticker."""
     try:
-        ticker_upper = ticker.upper()
-        cached_entry = _INFO_CACHE.get(ticker_upper)
-        if cached_entry and _cache_is_fresh(cached_entry[0]):
-            info = dict(cached_entry[1])
-        else:
-            disk_info = _load_cached_info(ticker)
-            info = dict(disk_info) if isinstance(disk_info, dict) else _build_company_stub(ticker)
-            _store_info_cache(ticker, info)
-            _save_cached_info(ticker, info)
+        try:
+            info = _get_company_info(ticker)
+        except UpstreamRateLimitError:
+            info = _build_company_stub(ticker)
 
         if "lastClose" not in info:
             history = _load_cached_history(ticker, "1y")
@@ -688,6 +892,7 @@ def get_stock_info(ticker: str):
                 _store_info_cache(ticker, info)
                 _save_cached_info(ticker, info)
 
+        ticker_upper = ticker.upper()
         return jsonify(
             {
                 "ticker": info.get("ticker", ticker_upper),
@@ -698,6 +903,11 @@ def get_stock_info(ticker: str):
                 "currency": info.get("currency", "USD"),
                 "lastClose": info.get("lastClose"),
                 "nextPrediction": info.get("nextPrediction"),
+                "week52High": info.get("week52High"),
+                "week52Low": info.get("week52Low"),
+                "peRatio": info.get("peRatio"),
+                "dividendYield": info.get("dividendYield"),
+                "eps": info.get("eps"),
             }
         )
     except Exception as exc:  # pragma: no cover - defensive
@@ -769,3 +979,10 @@ def health_check():
 
 
 application = app
+
+
+if __name__ == "__main__":
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "5000"))
+    debug = os.getenv("FLASK_DEBUG", "0") == "1"
+    app.run(host=host, port=port, debug=debug)
