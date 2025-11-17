@@ -43,7 +43,9 @@ load_dotenv()
 
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "").strip()
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 POLYGON_BASE_URL = "https://api.polygon.io"
+FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
 
 _HISTORY_CACHE: Dict[Tuple[str, str], Tuple[float, pd.DataFrame]] = {}
 _INFO_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -381,8 +383,85 @@ def _fetch_company_overview_alpha_vantage(ticker: str) -> Optional[Dict[str, Any
     return {key: value for key, value in overview.items() if value is not None}
 
 
+def _fetch_company_overview_polygon(ticker: str) -> Optional[Dict[str, Any]]:
+    """Get high-level company information from Polygon's Ticker Details endpoint."""
+    if not POLYGON_API_KEY:
+        return None
+
+    url = f"{POLYGON_BASE_URL}/v3/reference/tickers/{ticker.upper()}"
+    params = {"apiKey": POLYGON_API_KEY}
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+            headers=HTTP_HEADERS,
+        )
+    except requests.RequestException:
+        return None
+
+    if response.status_code == 429:
+        raise UpstreamRateLimitError("Polygon rate limit reached")
+
+    if response.status_code != 200:
+        return None
+
+    payload = response.json()
+    results = payload.get("results")
+    if not isinstance(results, dict):
+        return None
+
+    overview = {
+        "ticker": results.get("ticker", ticker.upper()),
+        "name": results.get("name"),
+        "marketCap": _coerce_float(results.get("market_cap")),
+        "sector": results.get("sector"),
+        "industry": results.get("industry"),
+        "currency": results.get("currency_name"),
+    }
+    return {key: value for key, value in overview.items() if value is not None}
+
+
+def _fetch_company_profile_finnhub(ticker: str) -> Optional[Dict[str, Any]]:
+    """Retrieve company fundamentals from Finnhub's Company Profile 2 endpoint."""
+    if not FINNHUB_API_KEY:
+        return None
+
+    params = {"symbol": ticker.upper(), "token": FINNHUB_API_KEY}
+    try:
+        response = requests.get(
+            f"{FINNHUB_BASE_URL}/stock/profile2",
+            params=params,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+            headers=HTTP_HEADERS,
+        )
+    except requests.RequestException:
+        return None
+
+    if response.status_code == 429:
+        raise UpstreamRateLimitError("Finnhub rate limit reached")
+
+    if not response.ok:
+        return None
+
+    payload = response.json()
+    if not isinstance(payload, dict) or not payload:
+        return None
+
+    overview = {
+        "ticker": payload.get("ticker", ticker.upper()),
+        "name": payload.get("name"),
+        "marketCap": _coerce_float(payload.get("marketCapitalization")),
+        "sector": payload.get("finnhubIndustry"),
+        "currency": payload.get("currency"),
+    }
+    return {key: value for key, value in overview.items() if value is not None}
+
+
+
+
 def _get_company_info(ticker: str, latest_price: Optional[float] = None) -> Dict[str, Any]:
-    """Return cached company metadata, refreshing from Alpha Vantage when needed."""
+    """Return cached company metadata, refreshing from providers when needed."""
     ticker_upper = ticker.upper()
     cached_entry = _INFO_CACHE.get(ticker_upper)
     if cached_entry and _cache_is_fresh(cached_entry[0]):
@@ -392,12 +471,26 @@ def _get_company_info(ticker: str, latest_price: Optional[float] = None) -> Dict
         info = dict(disk_info) if isinstance(disk_info, dict) else _build_company_stub(ticker)
 
     if _needs_overview_refresh(info):
-        try:
-            overview = _fetch_company_overview_alpha_vantage(ticker)
-        except UpstreamRateLimitError:
-            overview = None
-        if overview:
-            info.update(overview)
+        provider_overviews: List[Dict[str, Any]] = []
+        fetch_fns = [
+            _fetch_company_overview_alpha_vantage,
+            _fetch_company_overview_polygon,
+            _fetch_company_profile_finnhub,
+        ]
+        for fetch_fn in fetch_fns:
+            try:
+                overview = fetch_fn(ticker)
+                if overview:
+                    provider_overviews.append(overview)
+            except UpstreamRateLimitError:
+                continue
+
+        # Merge the results, giving priority to the earlier providers.
+        merged = {}
+        for overview in reversed(provider_overviews):
+            merged.update(overview)
+        if merged:
+            info.update(merged)
 
     if latest_price is not None:
         info["lastClose"] = float(latest_price)
