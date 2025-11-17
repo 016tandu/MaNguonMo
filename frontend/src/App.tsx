@@ -334,7 +334,7 @@ function App() {
         <div className="title-block">
           <TrendingUp className="title-icon" />
           <div>
-            <h1>Stock Price Predictor</h1>
+            <h1>Hệ thống Dự đoán Giá Cổ phiếu - Mã nguồn mở</h1>
             <p>Forecast market trends with an LSTM model powered backend.</p>
           </div>
         </div>
