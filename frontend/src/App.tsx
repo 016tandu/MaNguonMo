@@ -151,6 +151,7 @@ function App() {
   const [suggestions, setSuggestions] = useState<SearchResult[]>([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [suggestionsLoading, setSuggestionsLoading] = useState(false);
+  const suggestionsCache = useRef<Record<string, SearchResult[]>>({});
 
   useEffect(() => {
     let isMounted = true;
@@ -251,6 +252,11 @@ function App() {
       return;
     }
 
+    if (suggestionsCache.current[query]) {
+      setSuggestions(suggestionsCache.current[query]);
+      return;
+    }
+
     const controller = new AbortController();
     setSuggestionsLoading(true);
 
@@ -264,7 +270,9 @@ function App() {
           params: { q: query },
           signal: controller.signal,
         });
-        setSuggestions(response.data.results ?? []);
+        const results = response.data.results ?? [];
+        suggestionsCache.current[query] = results;
+        setSuggestions(results);
       } catch (err) {
         if (!axios.isCancel(err)) {
           console.error("Search suggestion error", err);
@@ -289,7 +297,6 @@ function App() {
   const handleSelectSuggestion = (symbol: string) => {
     setTicker(symbol);
     setShowSuggestions(false);
-    fetchStockData(symbol);
   };
 
   const latestHistorical = historicalData[historicalData.length - 1];
